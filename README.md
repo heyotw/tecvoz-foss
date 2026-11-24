@@ -91,6 +91,7 @@ The app looks up the same hostname. On your home Wi-Fi, set the phone's Wi-Fi DN
 | `ALLOW` | empty | clients allowed to use DNS forwarding |
 | `UPSTREAM` | `8.8.8.8` | DNS server for forwarded lookups |
 | `DNS_PORT` | `53` | DNS port |
+| `DNS_BIND` | `0.0.0.0` | address to bind; on systems where systemd-resolved holds `127.0.0.53:53`, use the NIC address (e.g. `10.128.0.4`) |
 
 ## Tests
 

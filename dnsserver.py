@@ -14,6 +14,7 @@ OVERRIDE_NAMES = {n.strip().lower().rstrip(".") for n in os.environ.get(
 UPSTREAM = (os.environ.get("UPSTREAM", "8.8.8.8"), 53)
 ALLOW = [ipaddress.ip_network(c.strip(), strict=False) for c in os.environ.get("ALLOW", "").split(",") if c.strip()]
 PORT = int(os.environ.get("DNS_PORT", "53"))
+BIND = os.environ.get("DNS_BIND", "0.0.0.0")    # set to the NIC address if systemd-resolved holds 127.0.0.53:53
 
 A, AAAA, IN = 1, 28, 1
 NOERROR, SERVFAIL, REFUSED = 0, 2, 5
@@ -76,7 +77,7 @@ def handle(sock, q, addr):
 
 def serve(port=PORT):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind(("0.0.0.0", port))
+    s.bind((BIND, port))
     print("DNS :%d  %s -> %s  forwarding for %s" % (port, sorted(OVERRIDE_NAMES), OVERRIDE_IP,
                                                    [str(n) for n in ALLOW] or "nobody"), flush=True)
     while True:
