@@ -6,7 +6,7 @@
   IPs/CIDRs), so this never becomes an open resolver usable for DNS amplification attacks.
   Everyone else gets REFUSED, and devices fall back to their secondary DNS.
 """
-import ipaddress, os, socket, struct, threading
+import ipaddress, os, socket, ssl, struct, threading
 
 OVERRIDE_IP = os.environ.get("OVERRIDE_IP", "127.0.0.1")
 OVERRIDE_NAMES = {n.strip().lower().rstrip(".") for n in os.environ.get(
@@ -15,6 +15,12 @@ UPSTREAM = (os.environ.get("UPSTREAM", "8.8.8.8"), 53)
 ALLOW = [ipaddress.ip_network(c.strip(), strict=False) for c in os.environ.get("ALLOW", "").split(",") if c.strip()]
 PORT = int(os.environ.get("DNS_PORT", "53"))
 BIND = os.environ.get("DNS_BIND", "0.0.0.0")    # set to the NIC address if systemd-resolved holds 127.0.0.53:53
+# DNS over TLS for Android "Private DNS": needs a cert for a hostname you own. With systemd LoadCredential
+# the files appear in $CREDENTIALS_DIRECTORY, so relative names are looked up there.
+_cred = os.environ.get("CREDENTIALS_DIRECTORY", "")
+DOT_CERT = os.path.join(_cred, os.environ.get("DOT_CERT", "")) if os.environ.get("DOT_CERT") else ""
+DOT_KEY = os.path.join(_cred, os.environ.get("DOT_KEY", "")) if os.environ.get("DOT_KEY") else ""
+DOT_PORT = int(os.environ.get("DOT_PORT", "853"))
 
 A, AAAA, IN = 1, 28, 1
 NOERROR, SERVFAIL, REFUSED = 0, 2, 5
@@ -53,26 +59,84 @@ def allowed(ip):
     return any(a in n for n in ALLOW)
 
 
-def handle(sock, q, addr):
+def recv_exact(s, n):
+    b = b""
+    while len(b) < n:
+        d = s.recv(n - len(b))
+        if not d:
+            raise ConnectionError("closed")
+        b += d
+    return b
+
+
+def forward_tcp(q):
+    """Forward over TCP so large answers are never truncated (used for DoT clients)."""
+    with socket.create_connection(UPSTREAM, timeout=3) as up:
+        up.sendall(struct.pack(">H", len(q)) + q)
+        return recv_exact(up, struct.unpack(">H", recv_exact(up, 2))[0])
+
+
+def forward_udp(q):
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as up:
+        up.settimeout(3)
+        up.sendto(q, UPSTREAM)
+        return up.recv(4096)
+
+
+def resolve(q, may_forward, forward):
+    """Reply bytes for query q, or None to stay silent on garbage."""
     p = parse_question(q)
     if p is None:
-        return
+        return None
     name, qtype, _ = p
     if name in OVERRIDE_NAMES:
-        sock.sendto(answer(q, NOERROR, OVERRIDE_IP if qtype == A else None), addr)   # AAAA etc: empty
-        return
-    if not allowed(addr[0]):
-        sock.sendto(answer(q, REFUSED), addr)
-        return
-    up = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    up.settimeout(3)
+        return answer(q, NOERROR, OVERRIDE_IP if qtype == A else None)   # AAAA etc: empty
+    if not may_forward:
+        return answer(q, REFUSED)
     try:
-        up.sendto(q, UPSTREAM)
-        sock.sendto(up.recv(4096), addr)
+        return forward(q)
     except OSError:
-        sock.sendto(answer(q, SERVFAIL), addr)
+        return answer(q, SERVFAIL)
+
+
+def handle(sock, q, addr):
+    r = resolve(q, allowed(addr[0]), forward_udp)
+    if r:
+        sock.sendto(r, addr)
+
+
+def handle_dot(conn):
+    """DNS over TLS (RFC 7858): 2-byte length-prefixed messages on one connection."""
+    try:
+        conn.settimeout(10)
+        while True:
+            q = recv_exact(conn, struct.unpack(">H", recv_exact(conn, 2))[0])
+            # ponytail: DoT forwards for anyone (TCP, so no amplification); add rate limits if abused
+            r = resolve(q, True, forward_tcp)
+            if r is None:
+                return
+            conn.sendall(struct.pack(">H", len(r)) + r)
+    except (OSError, ConnectionError, ValueError):
+        pass
     finally:
-        up.close()
+        conn.close()
+
+
+def serve_dot(cert, key, port=DOT_PORT):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(cert, key)
+    s = socket.create_server(("0.0.0.0", port), reuse_port=False)
+    print("DoT :%d (forwarding for anyone over TLS)" % port, flush=True)
+    while True:
+        c, _ = s.accept()
+
+        def run(c=c):
+            try:
+                handle_dot(ctx.wrap_socket(c, server_side=True))
+            except (OSError, ssl.SSLError):
+                c.close()
+        threading.Thread(target=run, daemon=True).start()
 
 
 def serve(port=PORT):
@@ -86,4 +150,6 @@ def serve(port=PORT):
 
 
 if __name__ == "__main__":
+    if DOT_CERT and DOT_KEY:
+        threading.Thread(target=serve_dot, args=(DOT_CERT, DOT_KEY), daemon=True).start()
     serve()

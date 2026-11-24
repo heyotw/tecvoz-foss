@@ -1,7 +1,7 @@
 """Self-check: play the app's side (captured from TW Viewer 1.5.7) against natserver.py over UDP."""
 import os, socket, struct, threading, time
 
-os.environ["NAT_PORT"] = "18989"
+os.environ.update(NAT_PORT="18989", NAT_HTTP_PORT="18080")
 import natserver as n
 
 
@@ -36,6 +36,25 @@ def test_fetch_unregistered_device_is_offline():
     assert b'<Cmd id="20006"><RequestSeq>1</RequestSeq><Status>2</Status>' in body, body
 
 
+def test_acme_challenge():
+    import tempfile, urllib.request, urllib.error
+    d = tempfile.mkdtemp()
+    os.makedirs(os.path.join(d, ".well-known/acme-challenge"))
+    tok = "abcDEF123_-xyz789abc"
+    open(os.path.join(d, ".well-known/acme-challenge", tok), "w").write(tok + ".thumb")
+    n.ACME_DIR = d
+    threading.Thread(target=n.http_server, daemon=True).start()
+    time.sleep(0.2)
+    base = "http://127.0.0.1:18080/.well-known/acme-challenge/"
+    assert urllib.request.urlopen(base + tok).read() == (tok + ".thumb").encode()
+    try:
+        urllib.request.urlopen(base + "..%2f..%2f..%2fetc%2fpasswd")
+        assert False, "traversal must 404"
+    except urllib.error.HTTPError as e:
+        assert e.code == 404
+
+
 if __name__ == "__main__":
     test_fetch_unregistered_device_is_offline()
+    test_acme_challenge()
     print("ok")

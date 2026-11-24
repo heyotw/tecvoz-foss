@@ -6,13 +6,15 @@ Layers, all little-endian:
   2. UDP   TVT reliable-UDP ("CNatUdt"): 24-byte header + payload
   3. Block 8-byte header (u16 version=0x0100, u16 options, i32 len) + XML command
 """
-import os, random, socket, struct, threading
+import os, random, re, socket, struct, threading
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
 
 PUBLIC_IP = os.environ.get("NAT_PUBLIC_IP", "127.0.0.1")   # address handed to clients
 NAT_PORT = int(os.environ.get("NAT_PORT", "8989"))
 HTTP_PORT = int(os.environ.get("NAT_HTTP_PORT", "80"))
+ACME_DIR = os.environ.get("ACME_DIR", "")      # certbot --webroot path, to get a TLS cert for dnsserver's DoT
+ACME_RE = re.compile(rb"^GET /\.well-known/acme-challenge/([A-Za-z0-9_-]{16,128}) HTTP/")
 
 SYN, DATA, ACK, RST = 0, 1, 2, 3
 HDR = struct.Struct("<BBBBIIIII")        # category cmd optionEnable reserved connId sendIdx recvIdx seq ack
@@ -148,6 +150,13 @@ def http_server():
         if b"/NatServer/CNatServerList.xml" in line:
             body = (SERVER_LIST % (PUBLIC_IP, NAT_PORT, NAT_PORT + 1)).encode()
             c.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(body) + body)
+        elif ACME_DIR and ACME_RE.match(line):
+            # Let's Encrypt HTTP-01 (certbot --webroot); token is base64url, so no path traversal
+            try:
+                body = open(os.path.join(ACME_DIR, ".well-known/acme-challenge", ACME_RE.match(line).group(1).decode()), "rb").read()
+                c.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(body) + body)
+            except OSError:
+                c.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
         else:
             c.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
         c.close()
