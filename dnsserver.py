@@ -1,29 +1,36 @@
 #!/usr/bin/env python3
-"""Tiny DNS server: points the dead vendor P2P hostnames at your own natserver.py.
+"""Public DNS server that points the offline vendor P2P hostnames at your own natserver.py.
 
-- Names in OVERRIDE_NAMES get an A record = OVERRIDE_IP (for anyone).
-- Every other query is forwarded to UPSTREAM, but only for clients in ALLOW (comma-separated
-  IPs/CIDRs), so this never becomes an open resolver usable for DNS amplification attacks.
-  Everyone else gets REFUSED, and devices fall back to their secondary DNS.
+Anyone can set a recorder's or phone's DNS to this server:
+- Names in OVERRIDE_NAMES get an A record = OVERRIDE_IP.
+- Everything else is forwarded to UPSTREAM.
+
+Being an open resolver, it is hardened against DNS amplification abuse:
+- UDP is rate limited per source IP (token bucket RATE/s, BURST); excess queries are dropped silently.
+- UDP answers over 512 bytes are replaced by a truncated reply, so big answers only go over TCP,
+  which can't be spoofed. ANY queries are refused.
+- TCP 53 and DNS over TLS (853, for Android "Private DNS") need a handshake, so they aren't limited.
 """
-import ipaddress, os, socket, ssl, struct, threading
+import os, socket, ssl, struct, threading, time
 
 OVERRIDE_IP = os.environ.get("OVERRIDE_IP", "127.0.0.1")
 OVERRIDE_NAMES = {n.strip().lower().rstrip(".") for n in os.environ.get(
     "OVERRIDE_NAMES", "admtecvozp2p.com.br,www.admtecvozp2p.com.br").split(",") if n.strip()}
-UPSTREAM = (os.environ.get("UPSTREAM", "8.8.8.8"), 53)
-ALLOW = [ipaddress.ip_network(c.strip(), strict=False) for c in os.environ.get("ALLOW", "").split(",") if c.strip()]
+UPSTREAM = (os.environ.get("UPSTREAM", "8.8.8.8"), int(os.environ.get("UPSTREAM_PORT", "53")))
 PORT = int(os.environ.get("DNS_PORT", "53"))
 BIND = os.environ.get("DNS_BIND", "0.0.0.0")    # set to the NIC address if systemd-resolved holds 127.0.0.53:53
-# DNS over TLS for Android "Private DNS": needs a cert for a hostname you own. With systemd LoadCredential
-# the files appear in $CREDENTIALS_DIRECTORY, so relative names are looked up there.
+RATE = float(os.environ.get("RATE", "20"))      # UDP queries per second per source IP
+BURST = float(os.environ.get("BURST", "100"))
+# DNS over TLS: needs a cert for a hostname you own. With systemd LoadCredential the files appear in
+# $CREDENTIALS_DIRECTORY, so relative names are looked up there.
 _cred = os.environ.get("CREDENTIALS_DIRECTORY", "")
 DOT_CERT = os.path.join(_cred, os.environ.get("DOT_CERT", "")) if os.environ.get("DOT_CERT") else ""
 DOT_KEY = os.path.join(_cred, os.environ.get("DOT_KEY", "")) if os.environ.get("DOT_KEY") else ""
 DOT_PORT = int(os.environ.get("DOT_PORT", "853"))
 
-A, AAAA, IN = 1, 28, 1
+A, AAAA, ANY, IN = 1, 28, 255, 1
 NOERROR, SERVFAIL, REFUSED = 0, 2, 5
+UDP_MAX = 512
 
 
 def parse_question(q):
@@ -43,20 +50,33 @@ def parse_question(q):
     return ".".join(labels).lower(), qtype, i + 5
 
 
-def answer(q, rcode, ip=None):
-    """Build a reply to query q echoing its question; with ip, add one A record."""
+def answer(q, rcode, ip=None, tc=False):
+    """Reply to query q echoing its question; with ip add one A record; tc sets the truncated bit."""
     _name, _qtype, end = parse_question(q)
     rd = q[2] & 0x01
-    flags = 0x8000 | 0x0400 * (rcode == NOERROR) | rd << 8 | 0x0080 | rcode   # QR, AA, RD, RA, rcode
+    flags = 0x8000 | 0x0400 * (rcode == NOERROR and not tc) | 0x0200 * tc | rd << 8 | 0x0080 | rcode
     out = q[:2] + struct.pack(">HHHHH", flags, 1, 1 if ip else 0, 0, 0) + q[12:end]
     if ip:
         out += struct.pack(">HHHIH", 0xC00C, A, IN, 60, 4) + socket.inet_aton(ip)
     return out
 
 
-def allowed(ip):
-    a = ipaddress.ip_address(ip)
-    return any(a in n for n in ALLOW)
+class RateLimit:
+    """Per-IP token bucket. ponytail: one dict + lock, pruned when large; fine for a few thousand qps."""
+
+    def __init__(self, rate, burst):
+        self.rate, self.burst, self.b, self.lock = rate, burst, {}, threading.Lock()
+
+    def allow(self, ip, now=None):
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            tokens, last = self.b.get(ip, (self.burst, now))
+            tokens = min(self.burst, tokens + (now - last) * self.rate)
+            ok = tokens >= 1
+            self.b[ip] = (tokens - 1 if ok else tokens, now)
+            if len(self.b) > 50000:   # forget idle clients (their bucket would be full again anyway)
+                self.b = {k: v for k, v in self.b.items() if now - v[1] < self.burst / self.rate}
+            return ok
 
 
 def recv_exact(s, n):
@@ -70,7 +90,7 @@ def recv_exact(s, n):
 
 
 def forward_tcp(q):
-    """Forward over TCP so large answers are never truncated (used for DoT clients)."""
+    """Forward over TCP so large answers are never truncated (TCP and DoT clients)."""
     with socket.create_connection(UPSTREAM, timeout=3) as up:
         up.sendall(struct.pack(">H", len(q)) + q)
         return recv_exact(up, struct.unpack(">H", recv_exact(up, 2))[0])
@@ -83,7 +103,7 @@ def forward_udp(q):
         return up.recv(4096)
 
 
-def resolve(q, may_forward, forward):
+def resolve(q, forward):
     """Reply bytes for query q, or None to stay silent on garbage."""
     p = parse_question(q)
     if p is None:
@@ -91,7 +111,7 @@ def resolve(q, may_forward, forward):
     name, qtype, _ = p
     if name in OVERRIDE_NAMES:
         return answer(q, NOERROR, OVERRIDE_IP if qtype == A else None)   # AAAA etc: empty
-    if not may_forward:
+    if qtype == ANY:
         return answer(q, REFUSED)
     try:
         return forward(q)
@@ -99,20 +119,22 @@ def resolve(q, may_forward, forward):
         return answer(q, SERVFAIL)
 
 
-def handle(sock, q, addr):
-    r = resolve(q, allowed(addr[0]), forward_udp)
-    if r:
-        sock.sendto(r, addr)
+def handle_udp(sock, q, addr):
+    r = resolve(q, forward_udp)
+    if r is None:
+        return
+    if len(r) > UDP_MAX:
+        r = answer(q, NOERROR, tc=True)     # client retries over TCP
+    sock.sendto(r, addr)
 
 
-def handle_dot(conn):
-    """DNS over TLS (RFC 7858): 2-byte length-prefixed messages on one connection."""
+def handle_stream(conn):
+    """TCP 53 / DNS over TLS (RFC 7766 / 7858): 2-byte length-prefixed messages on one connection."""
     try:
         conn.settimeout(10)
         while True:
             q = recv_exact(conn, struct.unpack(">H", recv_exact(conn, 2))[0])
-            # ponytail: DoT forwards for anyone (TCP, so no amplification); add rate limits if abused
-            r = resolve(q, True, forward_tcp)
+            r = resolve(q, forward_tcp)
             if r is None:
                 return
             conn.sendall(struct.pack(">H", len(r)) + r)
@@ -122,31 +144,38 @@ def handle_dot(conn):
         conn.close()
 
 
-def serve_dot(cert, key, port=DOT_PORT):
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    ctx.load_cert_chain(cert, key)
-    s = socket.create_server(("0.0.0.0", port), reuse_port=False)
-    print("DoT :%d (forwarding for anyone over TLS)" % port, flush=True)
+def serve_stream(port, bind="0.0.0.0", ctx=None):
+    s = socket.create_server((bind, port))
+    print("%s :%d" % ("DoT" if ctx else "TCP", port), flush=True)
     while True:
         c, _ = s.accept()
 
         def run(c=c):
             try:
-                handle_dot(ctx.wrap_socket(c, server_side=True))
+                handle_stream(ctx.wrap_socket(c, server_side=True) if ctx else c)
             except (OSError, ssl.SSLError):
                 c.close()
         threading.Thread(target=run, daemon=True).start()
 
 
-def serve(port=PORT):
+def serve_dot(cert, key, port=DOT_PORT):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(cert, key)
+    serve_stream(port, ctx=ctx)
+
+
+def serve(port=PORT, bind=BIND):
+    threading.Thread(target=serve_stream, args=(port, bind), daemon=True).start()
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind((BIND, port))
-    print("DNS :%d  %s -> %s  forwarding for %s" % (port, sorted(OVERRIDE_NAMES), OVERRIDE_IP,
-                                                   [str(n) for n in ALLOW] or "nobody"), flush=True)
+    s.bind((bind, port))
+    limit = RateLimit(RATE, BURST)
+    print("DNS :%d  %s -> %s  (public, UDP %g/s burst %g per IP)" % (
+        port, sorted(OVERRIDE_NAMES), OVERRIDE_IP, RATE, BURST), flush=True)
     while True:
         q, addr = s.recvfrom(512)
-        threading.Thread(target=handle, args=(s, q, addr), daemon=True).start()
+        if limit.allow(addr[0]):            # checked before spawning a thread, so floods stay cheap
+            threading.Thread(target=handle_udp, args=(s, q, addr), daemon=True).start()
 
 
 if __name__ == "__main__":
